@@ -84,6 +84,11 @@ abstract class GearmanManager {
     protected $stop_time = 0;
 
     /**
+     * Maximum time a child can run while restarting the daemon
+     */
+    protected $child_stop_timeout = 60;
+
+    /**
      * The filename to log to
      */
     protected $log_file;
@@ -319,7 +324,7 @@ abstract class GearmanManager {
             }
 
 
-            if($this->stop_work && time() - $this->stop_time > 60){
+            if($this->stop_work && time() - $this->stop_time > $this->child_stop_timeout){
                 $this->log("Children have not exited, killing.", GearmanManager::LOG_LEVEL_PROC_INFO);
                 $this->stop_children(SIGKILL);
             } else {
@@ -380,7 +385,7 @@ abstract class GearmanManager {
      */
     protected function getopt($config = array()) {
 
-        $opts = getopt("ac:dD:h:Hl:o:p:P:u:v::w:r:x:Z");
+        $opts = getopt("ac:dD:h:Hl:o:p:P:t:T:u:v::w:r:x:Z");
 
         if(isset($opts["H"])){
             $this->show_help();
@@ -443,6 +448,10 @@ abstract class GearmanManager {
 
         if (isset($opts['t'])) {
             $this->config['timeout'] = $opts['t'];
+        }
+
+        if (isset($opts['T'])) {
+            $this->config['child_stop_timeout'] = abs(intval($opts['T']));
         }
 
         if (isset($opts['h'])) {
@@ -601,6 +610,10 @@ abstract class GearmanManager {
             $this->config['exclude'] = explode(",", $this->config['exclude']);
         } else {
             $this->config['exclude'] = array();
+        }
+
+        if (!empty($this->config['child_stop_timeout'])) {
+            $this->child_stop_timeout = abs(intval($this->config['child_stop_timeout']));
         }
 
         /**
@@ -1210,6 +1223,7 @@ abstract class GearmanManager {
         echo "  -w DIR         Directory where workers are located, defaults to ./workers. If you are using PECL, you can provide multiple directories separated by a comma.\n";
         echo "  -r NUMBER      Maximum job iterations per worker\n";
         echo "  -t SECONDS     Maximum number of seconds gearmand server should wait for a worker to complete work before timing out and reissuing work to another worker.\n";
+        echo "  -T SECONDS     Maximum time a child can run while restarting the daemon\n";
         echo "  -x SECONDS     Maximum seconds for a worker to live\n";
         echo "  -Z             Parse the command line and config file then dump it to the screen and exit.\n";
         echo "\n";
