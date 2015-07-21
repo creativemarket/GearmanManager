@@ -171,6 +171,19 @@ abstract class GearmanManager {
     protected $max_run_time = 3600;
 
     /**
+     * +/- number of minutes workers will delay before restarting
+     * this prevents all your workers from restarting at the same
+     * time which causes a connection stampeded on your daemons
+     * So, a max_run_time of 3600 and worker_restart_splay of 600 means
+     * a worker will self restart between 3600 and 4200 seconds after
+     * it is started.
+     *
+     * This does not affect the time the parent process waits on children
+     * when shutting down.
+     */
+    protected $worker_restart_splay = 600;
+
+    /**
      * Maximum number of jobs this worker will do before quitting
      */
     protected $max_job_count = 0;
@@ -216,10 +229,20 @@ abstract class GearmanManager {
 
         $this->pid = getmypid();
 
+    }
+
+
+    /**
+     * Run the manager based on the config either passed in via command line or the config array.
+     *
+     * @param  array  $config Config to run
+     */
+    public function run($config = array())
+    {
         /**
          * Parse command line options. Loads the config file as well
          */
-        $this->getopt();
+        $this->getopt($config);
 
         /**
          * Register signal listeners
@@ -249,20 +272,7 @@ abstract class GearmanManager {
          */
         $this->bootstrap();
 
-
-        /**
-         * Main processing loop for the parent process
-         */
-        while(!$this->stop_work || count($this->children)) {
-
-            $this->process_loop();
-
-            /**
-             * php will eat up your cpu if you don't have this
-             */
-            usleep(50000);
-
-        }
+        $this->process_loop();
 
         /**
          * Kill the helper if it is running
@@ -277,39 +287,63 @@ abstract class GearmanManager {
 
     protected function process_loop() {
 
-        $status = null;
-
         /**
-         * Check for exited children
+         * Main processing loop for the parent process
          */
-        $exited = pcntl_wait( $status, WNOHANG );
+        while(!$this->stop_work || count($this->children)) {
 
-        /**
-         * We run other children, make sure this is a worker
-         */
-        if(isset($this->children[$exited])){
+            $status = null;
+
             /**
-             * If they have exited, remove them from the children array
-             * If we are not stopping work, start another in its place
+             * Check for exited children
              */
-            if($exited) {
-                $worker = $this->children[$exited];
-                unset($this->children[$exited]);
-                $this->log("Child $exited exited ($worker)", GearmanManager::LOG_LEVEL_PROC_INFO);
-                if(!$this->stop_work){
-                    $this->start_worker($worker);
+            $exited = pcntl_wait( $status, WNOHANG );
+
+            /**
+             * We run other children, make sure this is a worker
+             */
+            if(isset($this->children[$exited])){
+                /**
+                 * If they have exited, remove them from the children array
+                 * If we are not stopping work, start another in its place
+                 */
+                if($exited) {
+                    $worker = $this->children[$exited]['job'];
+                    unset($this->children[$exited]);
+                    $code = pcntl_wexitstatus($status);
+                    $this->log("Child $exited exited with error code of $code (".implode(",", $worker).")", GearmanManager::LOG_LEVEL_PROC_INFO);
+                    if(!$this->stop_work){
+                        $this->start_worker($worker);
+                    }
                 }
             }
-        }
 
 
-        if($this->stop_work && time() - $this->stop_time > 60){
-            $this->log("Children have not exited, killing.", GearmanManager::LOG_LEVEL_PROC_INFO);
-            $this->stop_children(SIGKILL);
+            if($this->stop_work && time() - $this->stop_time > 60){
+                $this->log("Children have not exited, killing.", GearmanManager::LOG_LEVEL_PROC_INFO);
+                $this->stop_children(SIGKILL);
+            } else {
+                /**
+                 *  If any children have been running 150% of max run time, forcibly terminate them
+                 */
+                if (!empty($this->children)) {
+                    foreach($this->children as $pid => $child) {
+                        if (!empty($child['start_time']) && time() - $child['start_time'] > $this->max_run_time * 1.5) {
+                            $this->log("Child $pid has been running too long. Forcibly killing process. (".implode(",", $child['job']).")", GearmanManager::LOG_LEVEL_PROC_INFO);
+                            posix_kill($pid, SIGKILL);
+                        }
+                    }
+                }
+            }
+
+            /**
+             * php will eat up your cpu if you don't have this
+             */
+            usleep(50000);
+
         }
 
     }
-
 
     /**
      * Handles anything we need to do when we are shutting down
@@ -328,8 +362,23 @@ abstract class GearmanManager {
     /**
      * Parses the command line options
      *
+     * @param array $config <ul>
+     *   <li><b>auto_update:</b> Automatically check for new worker code.</li>
+     *   <li><b>count:</b> Number of workers to start that do all jobs.</li>
+     *   <li><b>daemon:</b> Daemon, detach and run in the background when true.</li>
+     *   <li><b>file:</b> File to load the configuration from.</li>
+     *   <li><b>host:</b> Host to connect to in server:port format, although port is optional.</li>
+     *   <li><b>log_file:</b> Log output to LOG_FILE or use keyword 'syslog' for syslog support.</li>
+     *   <li><b>max_runs_per_worker:</b> Maximum job iterations per worker.</li>
+     *   <li><b>max_worker_lifetime:</b> Maximum number of seconds for a worker to live.</li>
+     *   <li><b>pid_file:</b> File to write process ID to.</li>
+     *   <li><b>prefix:</b> Job Class prefix to use.</li>
+     *   <li><b>timeout:</b> Maximum number of seconds germand server should wait for a worker to complete work before timing out and reissuing work to another worker.</li>
+     *   <li><b>worker_dir:</b> Directory where workers are located, defaults to ./workers.  If you are using PECL, you can provide multiple directories separated by comma.</li>
+     *   <li><b>verbose:</b> Set the log verbosity.  See the LOG_LEVEL_* constants.</li>
+     * </ul>
      */
-    protected function getopt() {
+    protected function getopt($config = array()) {
 
         $opts = getopt("ac:dD:h:Hl:o:p:P:u:v::w:r:x:Z");
 
@@ -337,15 +386,28 @@ abstract class GearmanManager {
             $this->show_help();
         }
 
-        if(isset($opts["c"]) && !file_exists($opts["c"])){
-            $this->show_help("Config file $opts[c] not found.");
-        }
-
         /**
          * parse the config file
          */
-        if(isset($opts["c"])){
-            $this->parse_config($opts["c"]);
+        if ( ! empty($config) && is_array($config) ) {
+            /**
+             * set the config to the passed in array
+             * @todo  we should probably do more checks to validate the values
+             */
+            $this->config = array_merge($this->config, $config);
+        }
+
+        if(isset($opts["c"])) {
+            $this->config['file'] = $opts['c'];
+        }
+
+        if (isset($this->config['file'])) {
+            if (file_exists($this->config['file'])) {
+                $this->parse_config($this->config['file']);
+            }
+            else {
+                $this->show_help("Config file {$this->config['file']} not found.");
+            }
         }
 
         /**
@@ -356,12 +418,7 @@ abstract class GearmanManager {
         }
 
         if(isset($opts["l"])){
-            if($opts["l"] === 'syslog'){
-                $this->log_syslog = true;
-            } else {
-                $this->log_file = $opts["l"];
-                $this->open_log_file($this->log_file);
-            }
+            $this->config['log_file'] = $opts["l"];
         }
 
         if (isset($opts['a'])) {
@@ -384,14 +441,20 @@ abstract class GearmanManager {
             $this->config['count'] = (int)$opts['D'];
         }
 
+        if (isset($opts['t'])) {
+            $this->config['timeout'] = $opts['t'];
+        }
+
         if (isset($opts['h'])) {
             $this->config['host'] = $opts['h'];
         }
 
         if (isset($opts['p'])) {
             $this->prefix = $opts['p'];
-        } elseif(!empty($this->config['prefix'])) {
+        } elseif(isset($this->config['prefix'])) {
             $this->prefix = $this->config['prefix'];
+        } elseif(defined('NET_GEARMAN_JOB_CLASS_PREFIX')) {
+            $this->prefix = NET_GEARMAN_JOB_CLASS_PREFIX;
         }
 
         if(isset($opts['u'])){
@@ -403,7 +466,7 @@ abstract class GearmanManager {
         /**
          * If we want to daemonize, fork here and exit
          */
-        if(isset($opts["d"])){
+        if(isset($opts["d"]) || ! empty($this->config['daemon'])) {
             $pid = pcntl_fork();
             if($pid>0){
                 $this->isparent = false;
@@ -429,8 +492,12 @@ abstract class GearmanManager {
                 $this->log_syslog = true;
             } else {
                 $this->log_file = $this->config['log_file'];
-                $this->open_log_file($this->log_file);
+                $this->open_log_file();
             }
+        }
+
+        if (isset($this->config['verbose'])) {
+            $this->verbose = (int) $this->config['verbose'] ?: GearmanManager::LOG_LEVEL_INFO;
         }
 
         if(isset($opts["v"])){
@@ -491,7 +558,7 @@ abstract class GearmanManager {
             $this->worker_dir = "./workers";
         }
 
-        $dirs = explode(",", $this->worker_dir);
+        $dirs = is_array($this->worker_dir) ? $this->worker_dir : explode(",", $this->worker_dir);
         foreach($dirs as &$dir){
             $dir = trim($dir);
             if(!file_exists($dir)){
@@ -500,11 +567,17 @@ abstract class GearmanManager {
         }
         unset($dir);
 
-        if(!empty($this->config['max_worker_lifetime'])){
+        if(isset($this->config['max_worker_lifetime']) && (int)$this->config['max_worker_lifetime'] > 0){
             $this->max_run_time = (int)$this->config['max_worker_lifetime'];
+        } else {
+            $this->config['max_worker_lifetime'] = $this->max_run_time;
         }
 
-        if(!empty($this->config['count'])){
+        if(isset($this->config['worker_restart_splay']) && (int)$this->config['worker_restart_splay'] > 0){
+            $this->worker_restart_splay = (int)$this->config['worker_restart_splay'];
+        }
+
+        if(isset($this->config['count']) && (int)$this->config['count'] > 0){
             $this->do_all_count = (int)$this->config['count'];
         }
 
@@ -515,7 +588,7 @@ abstract class GearmanManager {
                 $this->servers = $this->config['host'];
             }
         } else {
-            $this->servers = array("127.0.0.1");
+            $this->servers = array("127.0.0.1:4730");
         }
 
         if (!empty($this->config['include']) && $this->config['include'] != "*") {
@@ -540,23 +613,6 @@ abstract class GearmanManager {
 
     }
 
-
-   /**
-    *   Opens the logfile.  Will assign to $this->log_file_handle
-    *
-    *    @param   string    $file     The config filename.
-    *
-    */
-    protected function open_log_file($file) {
-        if ($this->log_file_handle) {
-            @fclose($this->log_file_handle);
-        }
-        $this->log_file_handle = @fopen($file, "a");
-        if(!$this->log_file_handle){
-            $this->show_help("Could not open log file $file");
-        }
-    }
-
     /**
      * Parses the config file
      *
@@ -567,7 +623,7 @@ abstract class GearmanManager {
 
         $this->log("Loading configuration from $file");
 
-        if(substr($file, -4) == ".php"){
+        if (substr($file, -4) == ".php"){
 
             require $file;
 
@@ -577,7 +633,7 @@ abstract class GearmanManager {
 
         }
 
-        if(empty($gearman_config)){
+        if (empty($gearman_config)){
             $this->show_help("No configuration found in $file");
         }
 
@@ -605,7 +661,7 @@ abstract class GearmanManager {
 
         $this->functions = array();
 
-        $dirs = explode(",", $this->worker_dir);
+        $dirs = is_array($this->worker_dir) ? $this->worker_dir : explode(",", $this->worker_dir);
 
         foreach($dirs as $dir){
 
@@ -636,7 +692,7 @@ abstract class GearmanManager {
                     }
 
                     if(!isset($this->functions[$function])){
-                        $this->functions[$function] = array();
+                        $this->functions[$function] = array('name' => $function);
                     }
 
                     if(!empty($this->config['functions'][$function]['dedicated_only'])){
@@ -669,6 +725,7 @@ abstract class GearmanManager {
                     }
 
                     $this->functions[$function]['path'] = $file;
+                    $this->functions[$function]['class_name'] = $this->prefix . $function;
 
                     /**
                      * Note about priority. This exploits an undocumented feature
@@ -713,13 +770,14 @@ abstract class GearmanManager {
                 $this->stop_work = true;
                 break;
             default:
+                $this->log("Helper forked with pid $pid", GearmanManager::LOG_LEVEL_PROC_INFO);
                 $this->helper_pid = $pid;
                 while($this->wait_for_signal && !$this->stop_work) {
                     usleep(5000);
                     pcntl_waitpid($pid, $status, WNOHANG);
 
                     if (pcntl_wifexited($status) && $status) {
-                         $this->log("Child exited with non-zero exit code $status.");
+                         $this->log("Helper child exited with non-zero exit code $status.");
                          exit(1);
                     }
 
@@ -734,7 +792,6 @@ abstract class GearmanManager {
      *
      */
     protected function validate_workers(){
-        $this->log("Helper forked", GearmanManager::LOG_LEVEL_PROC_INFO);
 
         $this->load_workers();
 
@@ -749,6 +806,7 @@ abstract class GearmanManager {
         /**
          * Since we got here, all must be ok, send a CONTINUE
          */
+        $this->log("Helper is running. Sending continue to $this->parent_pid.", GearmanManager::LOG_LEVEL_DEBUG);
         posix_kill($this->parent_pid, SIGCONT);
 
         if($this->check_code){
@@ -839,7 +897,12 @@ abstract class GearmanManager {
 
         static $all_workers;
 
-        if($worker == "all"){
+        if(is_array($worker)){
+
+            $worker_list = $worker;
+
+        } elseif($worker == "all"){
+
             if(is_null($all_workers)){
                 $all_workers = array();
                 foreach($this->functions as $func=>$settings){
@@ -851,6 +914,16 @@ abstract class GearmanManager {
             $worker_list = $all_workers;
         } else {
             $worker_list = array($worker);
+        }
+
+        $timeouts = array();
+        $default_timeout = ((isset($this->config['timeout'])) ?
+                            (int) $this->config['timeout'] : null);
+
+        // build up the list of worker timeouts
+        foreach ($worker_list as $worker_name) {
+            $timeouts[$worker_name] = ((isset($this->config['functions'][$worker_name]['timeout'])) ?
+                                    (int) $this->config['functions'][$worker_name]['timeout'] : $default_timeout);
         }
 
         $pid = pcntl_fork();
@@ -874,7 +947,14 @@ abstract class GearmanManager {
                     uasort($worker_list, array($this, "sort_priority"));
                 }
 
-                $this->start_lib_worker($worker_list);
+                if($this->worker_restart_splay > 0){
+                    mt_srand($this->pid); // Since all child threads use the same seed, we need to reseed with the pid so that we get a new "random" number.
+                    $splay = mt_rand(0, $this->worker_restart_splay);
+                    $this->max_run_time = $this->config['max_worker_lifetime'] + $splay;
+                    $this->log("Adjusted max run time to {$this->max_run_time} seconds (max_worker_lifetime:{$this->config['max_worker_lifetime']} + splay:{$splay})", GearmanManager::LOG_LEVEL_DEBUG);
+                }
+
+                $this->start_lib_worker($worker_list, $timeouts);
 
                 $this->log("Child exiting", GearmanManager::LOG_LEVEL_WORKER_INFO);
 
@@ -893,7 +973,10 @@ abstract class GearmanManager {
 
                 // parent
                 $this->log("Started child $pid (".implode(",", $worker_list).")", GearmanManager::LOG_LEVEL_PROC_INFO);
-                $this->children[$pid] = $worker;
+                $this->children[$pid] = array(
+                    "job" => $worker_list,
+                    "start_time" => time(),
+                );
         }
 
     }
@@ -923,8 +1006,8 @@ abstract class GearmanManager {
     protected function stop_children($signal=SIGTERM) {
         $this->log("Stopping children", GearmanManager::LOG_LEVEL_PROC_INFO);
 
-        foreach($this->children as $pid=>$worker){
-            $this->log("Stopping child $pid ($worker)", GearmanManager::LOG_LEVEL_PROC_INFO);
+        foreach($this->children as $pid=>$child){
+            $this->log("Stopping child $pid (".implode(",", $child['job']).")", GearmanManager::LOG_LEVEL_PROC_INFO);
             posix_kill($pid, $signal);
         }
 
@@ -990,12 +1073,31 @@ abstract class GearmanManager {
                 case SIGHUP:
                     $this->log("Restarting children", GearmanManager::LOG_LEVEL_PROC_INFO);
                     if ($this->log_file) {
-                        $this->open_log_file($this->log_file);
+                        $this->open_log_file();
                     }
                     $this->stop_children();
                     break;
                 default:
                 // handle all other signals
+            }
+        }
+
+    }
+
+    /**
+     * Opens the log file. If already open, closes it first.
+     */
+    protected function open_log_file() {
+
+        if($this->log_file){
+
+            if($this->log_file_handle){
+                fclose($this->log_file_handle);
+            }
+
+            $this->log_file_handle = @fopen($this->config['log_file'], "a");
+            if(!$this->log_file_handle){
+                $this->show_help("Could not open log file {$this->config['log_file']}");
             }
         }
 
@@ -1019,8 +1121,6 @@ abstract class GearmanManager {
             $init = true;
 
             if($this->log_file_handle){
-                list($ts, $ms) = explode(".", sprintf("%f", microtime(true)));
-                $ds = date("Y-m-d H:i:s").".".str_pad($ms, 6, 0);
                 fwrite($this->log_file_handle, "Date                         PID   Type   Message\n");
             } else {
                 echo "PID   Type   Message\n";
@@ -1105,10 +1205,11 @@ abstract class GearmanManager {
         echo "  -l LOG_FILE    Log output to LOG_FILE or use keyword 'syslog' for syslog support\n";
         echo "  -p PREFIX      Optional prefix for functions/classes of PECL workers. PEAR requires a constant be defined in code.\n";
         echo "  -P PID_FILE    File to write process ID out to\n";
-        echo "  -u USERNAME    Run wokers as USERNAME\n";
+        echo "  -u USERNAME    Run workers as USERNAME\n";
         echo "  -v             Increase verbosity level by one\n";
         echo "  -w DIR         Directory where workers are located, defaults to ./workers. If you are using PECL, you can provide multiple directories separated by a comma.\n";
         echo "  -r NUMBER      Maximum job iterations per worker\n";
+        echo "  -t SECONDS     Maximum number of seconds gearmand server should wait for a worker to complete work before timing out and reissuing work to another worker.\n";
         echo "  -x SECONDS     Maximum seconds for a worker to live\n";
         echo "  -Z             Parse the command line and config file then dump it to the screen and exit.\n";
         echo "\n";
@@ -1116,5 +1217,3 @@ abstract class GearmanManager {
     }
 
 }
-
-?>
