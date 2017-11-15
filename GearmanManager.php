@@ -299,6 +299,7 @@ abstract class GearmanManager {
 
             $status = null;
 
+            pcntl_signal_dispatch();
             /**
              * Check for exited children
              */
