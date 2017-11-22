@@ -56,6 +56,7 @@ class GearmanPeclManager extends GearmanManager {
         $start = time();
 
         while(!$this->stop_work){
+            pcntl_signal_dispatch();
 
             if(@$thisWorker->work() ||
                $thisWorker->returnCode() == GEARMAN_IO_WAIT ||
